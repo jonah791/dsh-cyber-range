@@ -19,7 +19,7 @@ import {
   buildCurlCmd, parseCurlOutput, buildSshCmd, buildPostBody, buildGetPath, basicAuthOf,
   normalizeCharset, charsetBounds, bisectExtract, judgeProbe, defaultSleepThresholdMs,
 } from './logic.js'
-import { buildStamp, readPackageVersion, tracedExecute, type TraceAction } from './trace.js'
+import { buildStamp, readPackageVersion, summarizeUrl, tracedExecute, type TraceAction } from './trace.js'
 
 export const name = 'cyber-range'
 export const inject = ['tools'] as const
@@ -225,9 +225,11 @@ export function apply(ctx: Context, config: Config): void {
     },
     // otw_blind 走 node:http 直连（不经 WSL bash），故无 shell 命令形态；
     // 其参数摘要里的 `template`/`expr`/`injectParam` 就是「命令是怎么拼出来的」的等价物。
+    // ⚠ `target` 必须过 `summarizeUrl` —— `otw_blind` 的 url 允许内嵌 `user:pass@`（会转 Basic auth），
+    //    裸记 url 等于把凭据写进轨迹（2026-09-14 冒烟测试实测发现；由 tests/trace.test.mjs 接线守卫钉住）。
     otw_blind: {
       action: 'blind',
-      targetOf: (a) => (typeof a['url'] === 'string' ? a['url'] : undefined),
+      targetOf: (a) => (typeof a['url'] === 'string' ? summarizeUrl(a['url']) : undefined),
     },
   }
   const reg = (tool: { name: string; execute?: unknown; [k: string]: unknown }) => {

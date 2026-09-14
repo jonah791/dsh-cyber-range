@@ -190,6 +190,7 @@ dsh-cyber-range/src/index.ts
 | A15 | 观测不反噬：不可写路径返回 `false` 且不抛、返回值/异常传播不变 | `npm test` → `tests/trace.test.mjs`「尸体测试」「观测失败不反噬」「异常原样重抛（同一对象）」 | **已实测（2026-09-14）** |
 | A16 | 隐私红线：口令/用户名/cookie/URL 内嵌凭据/远程命令**绝不出现在落盘行里** | `npm test` → 隐私尸体测试：喂 `<secret>` 参数 → 断言文件内搜不到，且 `pass=<N chars>` 出现 | **已实测（2026-09-14）** |
 | A17 | 线上自证（五问一条命令可答） | `tail -3 <DSH_HOME>/cyber-range-trace.jsonl` → `build` / `action`+`target`+`params` / `ok`+`exitCode` / `durationMs` 一齐可见 | **待线上验收**（需一次真实工具调用） |
+| A18 | **接线守卫：`otw_blind` 的 `target` 必须过 `summarizeUrl`**（URL 内嵌凭据不得落盘） | `npm test` → `tests/trace.test.mjs`「接线守卫（尸体测试）」：静态断言 `otw_blind` 的 `targetOf` 块含 `summarizeUrl(`，且裸内插形态（修复前写法）**不存在** | **已实测（2026-09-14，60/60）** |
 
 ## 8 · 与实现的关系
 
@@ -216,8 +217,14 @@ dsh-cyber-range/src/index.ts
     应用层结果由 `status` 单独表达——两者不得互相掩盖（进化规则 1「语义精确性」）。
   - **行为变更清单**：**无**。工具签名/参数/返回值/render 逐字不变；`tracedExecute` 只做「落两行 + 原样转发」，
     且异常**原样重抛同一个对象**（不是包装后的 Error）——由单测钉住。
-  - **测试**：`tests/trace.test.mjs`（20 条）——含尸体测试、隐私尸体测试、注入时钟耗时断言、
-    坏行/半行/空行/缺失文件/目录路径的解析退化。全仓 39 → **59/59**。
+  - **测试**：`tests/trace.test.mjs`（21 条）——含尸体测试、隐私尸体测试、注入时钟耗时断言、
+    坏行/半行/空行/缺失文件/目录路径的解析退化。全仓 39 → **60/60**。
+  - **⚠ 端到端冒烟测试当场抓到我自己的一个真缺陷（已修 + 加静态守卫）**：`otw_blind` 的 `TRACE_SPEC.targetOf`
+    最初写的是「原样返回 `args.url`」——而该工具的 `url` **允许内嵌 `user:pass@`**（`basicAuthOf` 会把它转成
+    Basic auth）⇒ `target` 字段会把**凭据写进轨迹**。单元测试全绿也发现不了它（纯函数 `summarizeUrl` 是对的，
+    错在**接线**）。修法：`targetOf` 改为 `summarizeUrl(a['url'])`；并加**接线静态守卫**（A18）——
+    判据「会落盘的 URL 必须过 `summarizeUrl`」与 `shell-contract` 的「进 bash 的串必须过 `shellQuote`」同构。
+    **教训：纯函数单测覆盖不到接线错误，必须有一条端到端冒烟（挂载 + 真调一次 + 看落盘行）。**
   - **未决**：轨迹**无轮转**（当前按日/按月手删）；线上自证（A17）待一次真实调用。
 
 - **2026-09-14 · 命令注入缺陷（curl / ssh 命令的半吊子转义，已修 + 加机器守卫）**

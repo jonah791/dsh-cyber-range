@@ -260,6 +260,24 @@ test('tracedExecute 观测失败不反噬：不可写路径下返回值照常、
   assert.deepEqual(await wrapped({ host: 'h' }), { status: 200, body: 'ok' })
 })
 
+test('接线守卫（尸体测试）：otw_blind 的 target 投影必须过 summarizeUrl 剥离 URL 内嵌凭据', () => {
+  // 真实缺陷（2026-09-14 冒烟测试实测发现）：接线层曾把 `otw_blind` 的 url **原样**记进 `target`
+  // ——而该工具的 url 允许内嵌 `user:pass@`（会转 Basic auth），等于把凭据写进轨迹。
+  // 静态守卫（与 tests/shell-contract.test.mjs 同风格）：命令模板里的每个外来串都要过转义，
+  // 这里同理——「会落盘的 URL」必须过 summarizeUrl。
+  const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
+  const at = src.indexOf('otw_blind:')
+  assert.ok(at > 0, '接线层必须保留 otw_blind 的 TRACE_SPEC 条目')
+  const block = src.slice(at, at + 400)
+  assert.ok(block.includes('summarizeUrl('), 'otw_blind 的 targetOf 必须经 summarizeUrl 剥离凭据')
+  // 尸体样本：裸内插形态必须不存在（修复前的写法）
+  assert.equal(
+    /targetOf:\s*\(a\)\s*=>\s*\(typeof a\['url'\]\s*===\s*'string'\s*\?\s*a\['url'\]/.test(src),
+    false,
+    '发现裸内插 url 的 targetOf——凭据会落盘！',
+  )
+})
+
 test('cleanup', () => {
   rmSync(tmp, { recursive: true, force: true })
 })
