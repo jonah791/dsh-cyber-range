@@ -13,10 +13,13 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { spawn } from 'node:child_process'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   buildCurlCmd, parseCurlOutput, buildSshCmd, buildPostBody, buildGetPath, basicAuthOf,
   normalizeCharset, charsetBounds, bisectExtract, judgeProbe, defaultSleepThresholdMs,
 } from './logic.js'
+import { buildStamp, readPackageVersion, tracedExecute, type TraceAction } from './trace.js'
 
 export const name = 'cyber-range'
 export const inject = ['tools'] as const
@@ -196,7 +199,49 @@ async function blindExtract(opts: {
 // ════════════════════════ 插件挂载 ════════════════════════
 
 export function apply(ctx: Context, config: Config): void {
-  ctx.tools.register(defineTool({
+  // ── 可维护性 S4：自证轨迹（`<DSH_HOME>/cyber-range-trace.jsonl`）────────────────
+  // 单一切面：三个工具**全部**经 `reg()` 注册，轨迹接线只在这一处落笔（漏一处即新缺陷）。
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const SELF = join(HERE, 'index.js')
+  const BUILD = buildStamp(SELF, readPackageVersion(SELF))
+  const proxyHost = config.proxyHost ?? '127.0.0.1'
+  const proxyPort = config.proxyPort ?? 16888
+
+  /** 每个工具的动作类型 + 目标投影 + 命令原文投影（**纯函数**，供 `tracedExecute` 落脱敏摘要）。 */
+  const TRACE_SPEC: Record<string, { action: TraceAction; targetOf?: (a: Record<string, unknown>) => string | undefined; cmdOf?: (a: Record<string, unknown>) => string | undefined }> = {
+    otw_request: {
+      action: 'request',
+      targetOf: (a) => (typeof a['host'] === 'string' ? a['host'] : undefined),
+      cmdOf: (a) => buildCurlCmd(a as unknown as Parameters<typeof buildCurlCmd>[0]),
+    },
+    otw_ssh: {
+      action: 'ssh',
+      targetOf: (a) => (typeof a['host'] === 'string' ? a['host'] : undefined),
+      cmdOf: (a) => buildSshCmd({
+        host: String(a['host'] ?? ''), port: Number(a['port'] ?? 2220),
+        user: String(a['user'] ?? ''), pass: String(a['pass'] ?? ''),
+        command: String(a['command'] ?? ''), proxyHost, proxyPort,
+      }),
+    },
+    // otw_blind 走 node:http 直连（不经 WSL bash），故无 shell 命令形态；
+    // 其参数摘要里的 `template`/`expr`/`injectParam` 就是「命令是怎么拼出来的」的等价物。
+    otw_blind: {
+      action: 'blind',
+      targetOf: (a) => (typeof a['url'] === 'string' ? a['url'] : undefined),
+    },
+  }
+  const reg = (tool: { name: string; execute?: unknown; [k: string]: unknown }) => {
+    const spec = TRACE_SPEC[tool.name]
+    const execute = typeof tool.execute === 'function' ? (tool.execute as (a: unknown) => Promise<unknown>) : undefined
+    return ctx.tools.register(defineTool({
+      ...tool,
+      ...(spec !== undefined && execute !== undefined
+        ? { execute: tracedExecute({ build: BUILD, ...spec }, execute) }
+        : {}),
+    } as never))
+  }
+
+  reg({
     name: 'otw_request',
     description: 'OverTheWire HTTP 直连请求（Basic auth + Host header，绕过代理环境变量直连）。用于 Natas 等 Web 关卡：GET/POST、携带 cookie、返回状态码与 body。直连比走代理快（Natas 实测 0.6s vs 1.5s+）。',
     parameters: {
@@ -226,9 +271,9 @@ export function apply(ctx: Context, config: Config): void {
         return { status: 0, body: '', truncated: false, error: e instanceof Error ? e.message : String(e) }
       }
     },
-  }))
+  })
 
-  ctx.tools.register(defineTool({
+  reg({
     name: 'otw_ssh',
     description: 'OverTheWire SSH 命令执行（clash 代理 CONNECT 隧道，直连被墙时的标准通道）。用于 Bandit/Leviathan 等 SSH 关卡：执行远程命令返回输出。',
     parameters: {
@@ -248,9 +293,9 @@ export function apply(ctx: Context, config: Config): void {
         proxyHost: config.proxyHost ?? '127.0.0.1', proxyPort: config.proxyPort ?? 16888,
       })
     },
-  }))
+  })
 
-  ctx.tools.register(defineTool({
+  reg({
     name: 'otw_blind',
     description: '通用 SQL 盲注引擎：按注入模板（{COND} 占位）+ 条件（ascii_gt/ascii_eq）二分提取目标字符串。mode=time（SLEEP 判定，3 次中位数抗网络抖动）或 mode=bool（响应含 trueText 判定）。规避 LIKE 通配符陷阱（用 ASCII(SUBSTRING) 精确比较）。',
     parameters: {
@@ -279,7 +324,7 @@ export function apply(ctx: Context, config: Config): void {
         sleepSec: args.sleepSec, trueText: args.trueText, maxLen: args.maxLen, charset: args.charset,
       })
     },
-  }))
+  })
 
   ;(ctx as any).on('ready', () => {
     ctx.logger('dsh-cyber-range').info('ready: otw_request / otw_ssh / otw_blind')
