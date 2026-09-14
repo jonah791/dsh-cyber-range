@@ -134,19 +134,62 @@ dsh-cyber-range/src/index.ts
 | A4 | Basic auth 自动装配 | 上例 401→200 的差异（不带 user 应得 401） | 待验收 |
 | A5 | SSH 走代理隧道 | `otw_ssh host=bandit.labs.overthewire.org user=bandit0 pass=bandit0 command=id` → `ok:true` 且 stdout 含 `uid=` | 待验收（依赖 clash 16888） |
 | A6 | 盲注 3 样本中位数 | 对一个已知时间的靶场页跑 `otw_blind`，`queries` ≈ 3×判定数（二分 log2(62)≈6 → 每位 ≈18） | 待验收 |
-| A7 | 越界即收束 | `maxLen=40` 提取到空/短串时提前返回而非跑满 40 位 | 待验收 |
+| A7 | ~~越界即收束~~ **原命题已被证伪并订正**：越界**不会**提前返回，而是补 `0` 到 maxLen | 见下方 A12 与 §9「A7 命题订正」——`maxLen` 必须由调用方给准 | **已实测（2026-09-14，命题翻转）** |
 | A8 | 失败不抛异常 | 把 `host` 指向不可达域 → 返回带 `error` 的结构化结果，调用不抛 | 待验收 |
+| A9 | 命令拼装注入防线（WSL bash 逃逸） | `npm test` → `tests/shell-contract.test.mjs`：静态守卫要求命令模板内每个 `${…}` 必为 `shellQuote(...)` 或已转义别名；**尸体样本**（修复前的 5 处裸内插）必须全被拦下 | **已实测（2026-09-14，39/39 pass）** |
+| A10 | 命令拼装集中在 `logic.ts`，接线层无裸命令文本 | `npm test` → 断言 `src/index.ts` 不含 `sshpass`/`curl -s`/`ProxyCommand`/`StrictHostKeyChecking` | **已实测（2026-09-14）** |
+| A11 | 纯逻辑（命令拼装/输出解析/二分判定）有失败路径覆盖 | `npm test` → `tests/logic.test.mjs`：非法百分号编码抛 `URIError`、单行输出 status=0、超长 body 截断、空字符集回落 32/126、probe 抛错保留已提取前缀、时间盲注空样本判假 | **已实测（2026-09-14）** |
+| A12 | 二分提取的终止语义（三条停 + `0` 填充） | `npm test` → `maxLen=目标长度` 得完整串；`maxLen` 偏大得尾随 `0`；字符码 > csMax 或落字符集空隙则终止 | **已实测（2026-09-14）** |
+| A13 | `logic.ts` 保持纯逻辑（可离线单测） | `npm test` → 断言 `src/logic.ts` 不含 `child_process`、不含 `httpRequest`/`fetch(` | **已实测（2026-09-14）** |
 
 ## 8 · 与实现的关系
 
-- 主实现：`self-plugins/dsh-cyber-range/src/index.ts`（341 行，单文件；含 `rawHttp` / `spawnWsl` / `sshExec` / `blindProbe` / `blindExtract` 5 个内部函数）。
+- 主实现：`self-plugins/dsh-cyber-range/src/index.ts`（接线与 IO：`rawHttp` / `spawnWsl` / `sshExec` / `blindProbe` / `blindExtract`）+ `src/logic.ts`（**纯逻辑层**：`shellQuote` / `buildCurlCmd` / `parseCurlOutput` / `buildSshCmd` / `buildPostBody` / `buildGetPath` / `basicAuthOf` / `normalizeCharset` / `charsetBounds` / `buildCond` / `bisectExtract` / `judgeProbe` / `defaultSleepThresholdMs`）。
 - 同语义副本：无（`dsh-exploit-kit` 是**分工相邻**而非同语义）。
 - 未实现/未验证部分**显式标注**：
   - `Config.enabled` 与 `Config.defaultResolveIp` 在 `apply` 内**未被消费**（ENABLED 只由组合行 `disabled` 控制）。
-  - 无 `tests/`：A1–A8 全部**待验收**。
-  - `otw_blind` 的 `condType='like_prefix'` 分支实现与 `ascii_gt` **完全相同**（源码注释说明用 ASCII 比较规避 LIKE 陷阱）——即三个 condType 其实只有两种行为。
+  - **单测（2026-09-14 补课已补）**：`tests/logic.test.mjs`（30）+ `tests/shell-contract.test.mjs`（9）= **39/39 全过**；`npm test` 一条命令可复跑。A1–A8 仍需**真实网络/靶场**的线上验收（离线单测不能替代）。
+  - `otw_blind` 的 `condType='like_prefix'` 分支实现与 `ascii_gt` **完全相同**（源码注释说明用 ASCII 比较规避 LIKE 陷阱）——即三个 condType 其实只有两种行为；已由单测钉住。
+  - `bisectExtract` 的**终止语义**已由单测钉住（见 A12 与 §10 U5）：算法不感知字符串结尾，`maxLen` 给大了会尾随补 `0`。
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 · 命令注入缺陷（curl / ssh 命令的半吊子转义，已修 + 加机器守卫）**
+  - **症状**：`otw_request` 的 curl 命令与 `otw_ssh` 的 ssh 命令由模板字符串拼成，
+    其中 `userAgent`/`data` 做了 `'` → `'\''` 转义，而 **`user`/`pass`/`cookie`/`host`/`path`/`resolveIp`/
+    `command`/代理地址 原样内插**（`-u '${user}:${pass}'`、`-b '${cookie}'`、`'http://${host}${path}'`、
+    `sshpass -p '${pass}'` … `'${command}'`）。命令最终由 **WSL 内的 `bash -c`** 执行，
+    故 `cookie = "x'; <任意命令>; '"` 即等于在本机 WSL 内执行任意命令。
+  - **证伪证据（修前）**：`tests/logic.test.mjs` 的注入防线断言在原形态上真实失败
+    （`assertNoEscape`：`-b '${HOSTILE}'` 原样出现在命令里），并由 `tests/shell-contract.test.mjs`
+    的尸体测试独立复核（修复前的 5 处裸内插样本必须被静态守卫全部拦下）。
+  - **修复**：新增 `src/logic.ts:shellQuote()`（单一真源的 bash 单引号转义），
+    `buildCurlCmd`/`buildSshCmd` 的**每一个**外来串统一过它；`ProxyCommand=` 前缀留在引号外（与修复前逐字一致）。
+  - **语义被补充（新不变量）**：**任何进入 `bash -c` 命令串的外来字符串必须先 `shellQuote()`**——
+    由静态守卫机器锁住（`tests/shell-contract.test.mjs`）。
+  - **行为变更清单**：正常输入下产物**逐字节一致**，唯二差异是 `--resolve` 的值与 ssh 的 `user@host`/`-p <port>`
+    从「无引号」变为「单引号包裹」——**shell argv 语义不变**（仍是同一个参数），且这两处此前也是未转义面。
+  - **教训（与 `dsh-blue-team` 同型，已回写技能 `dsh-plugin-testability`）**：
+    **同类调用点只护住一处 = 半吊子防线**。作者已为 `userAgent`/`data` 写了转义，却没覆盖同一模板里的另外 5 个变量——
+    引入转义 helper 后必须**逐个调用点**断言，而不是「有一个用例过了就算防线在」。
+
+- **2026-09-14 · A7 命题订正（文档预期写错，不是代码错）**
+  - 原 A7 写「`maxLen=40` 提取到空/短串时**提前返回**而非跑满 40 位」——**实测为假**。
+    真实语义：SQL 侧 `ASCII(SUBSTRING(...))` 越界返回 `0` ⇒ 条件恒假 ⇒ 二分收敛到字符集最小值 `'0'`，
+    而 `'0'` 在 `alnum` 内 ⇒ **继续追加**，直到跑满 `maxLen`。
+  - 处置：**订正文档命题**（A7 翻转 + A12 钉住真实语义 + U5 登记），不在代码里凑答案——
+    这与 search-pro 的 `decodeDdgUrl` 教训同源：*先判「代码错还是预期错」*。
+
+- **2026-09-14 · 逻辑可测试化（纯函数抽取，零行为变更）**
+  - **语义被确认**：`buildCurlCmd`/`buildSshCmd`/`parseCurlOutput`/`buildPostBody`/`buildGetPath`/
+    `basicAuthOf`/`normalizeCharset`/`charsetBounds`/`buildCond`/`bisectExtract`/`judgeProbe` 从 `index.ts` 的内联逻辑搬入
+    `src/logic.ts`，逐条对齐原实现；`blindExtract` 保留 `{result, queries, error?}` 外壳与
+    「抛错时返回已提取前缀」的语义（由 `bisectExtract` 内部 catch 实现）。
+  - **语义被补充（此前无人知道的真实语义）**：`parseCurlOutput` 单行输出 → `status=0` 且 body=整串；
+    `buildCurlCmd` 空串 `path` 会产出 `http://host`（`??` 不兜空串）；`buildPostBody` 无 `=` 的段以空值加入、
+    重复键由最后 `set` 覆盖；`judgeProbe` 的 time 模式单样本判假（`sorted[1] ?? 0`）；
+    `basicAuthOf`/`buildPostBody` 遇非法百分号编码抛 `URIError`（不静默）。
+  - **语义被修正（我自己的预期错）**：首版把「目标为空串 → 结果为空」写进断言，实测是**补 `0`**（同 A7 订正）。
 
 - **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
   - 语义**被确认**：3 工具面 / WSL 为唯一提权通道 / 盲注恒用 ASCII 比较 / 每次判定 3 样本。
@@ -158,5 +201,11 @@ dsh-cyber-range/src/index.ts
 
 - **U1 `defaultResolveIp` 死配置**：预期是「缺省用固定 IP 解析」，实现里 `otw_request` 只认 `args.resolveIp`。倾向：要么让 `execute` 回退读 `config.defaultResolveIp`，要么删字段（需主人裁决，本轮只记录不动源）。
 - **U2 缺侧车轨迹**：`otw_blind` 的每次探测（耗时/判定/字符）未落盘，事后无法回答「它为什么提取出这个串」。倾向：按 §5.22 落 `<DSH_HOME>/cyber-range-trace.jsonl`。
-- **U3 凭据转义**：`sshpass -p '<pass>'` 未做 `'\''` 转义，密码含单引号会断——靶场密码通常是字母数字，风险低但应修。
+- **U3 凭据转义（✅ 2026-09-14 已闭环，且范围远大于原判）**：原文写「`sshpass -p '<pass>'` 未转义，风险低但应修」。
+  实测**不止 pass**：curl 与 ssh 两条命令共 **7 个外来字段**未转义（`user`/`pass`/`cookie`/`host`/`path`/`resolveIp`/`command`
+  + 代理地址），且命令由 **WSL bash** 执行 ⇒ 不是「密码含单引号会断」，而是**可逃逸执行任意命令**。
+  已修（统一 `shellQuote`）+ 静态守卫锁死；风险等级由「低」更正为**高**（已消除）。
+- **U5 `bisectExtract` 不感知字符串结尾（2026-09-14 补课实测登记，未决）**：`maxLen` 给大了会尾随补 `0`
+  （见 §9「A7 命题订正」）。倾向：加一个终止条件——例如每位先测 `LENGTH(expr) >= pos`，或把
+  「收敛到 csMin 且字符为 `0`」视为结束信号。**需真实靶场验证后由主人裁决**（改的是提取语义，不能靠单测猜）。
 - **U4 授权边界靠纪律**：是否给工具加「host 白名单」（只允许 `*.overthewire.org`）？倾向：**不加**（会阻碍主人授权的其他靶场），保持纪律约束。
